@@ -7,11 +7,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /*** defines ***/
@@ -45,12 +47,15 @@ typedef struct erow {
 struct editorConfig {
     int cx, cy;  // cursor x and y position in row[_].chars
     int rx;  // cursor x position in row[_].render
-    int rowoff;  // row offset
-    int coloff;  // column offset
+    int rowoff;  // row offset in doc
+    int coloff;  // column offset in doc
     int screenrows;
-    int screencols;
+    int screencols; 
     int numrows;
-    erow * row;  // just 1 row for now
+    erow * row;
+    char * filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
     struct termios orig_termios;
 };
 
@@ -232,6 +237,11 @@ int getWindowSize(int *rows, int *cols) {
 
 /*** row operations ***/
 
+/**
+ * editorRowCxToRx:
+ * 
+ * Convert the text documents row->chars cx index to row->render rx index.
+*/
 int editorRowCxToRx(erow * row, int cx) {
     int rx = 0;
 
@@ -276,7 +286,8 @@ void editorUpdateRow(erow * row) {
 /**
  * editorAppendRow:
  * 
- * Add new row to E.row's with the inputted string s.
+ * Add new row to E.row's with the inputted string s with atmost len bytes 
+ * copied.
 */
 void editorAppendRow(char * s, size_t len) {
     // TODO: add error handling of failed realloc
@@ -304,6 +315,9 @@ void editorAppendRow(char * s, size_t len) {
  * in editorConfig E.
 */
 void editorOpen(char * filename) {
+    free(E.filename);
+    E.filename = strndup(filename, 20);
+
     FILE *fp = fopen(filename, "r");
     if (!fp) die("fopen");
 
@@ -388,7 +402,7 @@ void editorScroll() {
 /**
  * editorDrawRows:
  * 
- * Draws '|' next to every line in editor, DEFAULT_ROWS number of rowss
+ * Draws '~' next to every line in editor.
 */
 void editorDrawRows(struct abuf *ab) {
     // draw first n-1 rows
@@ -425,9 +439,51 @@ void editorDrawRows(struct abuf *ab) {
         }
 
         abAppend(ab, "\x1b[K", 3);
-        if (y < E.screenrows - 1) {
-            abAppend(ab, "\r\n", 2);
+        abAppend(ab, "\r\n", 2);
+    }
+}
+
+/**
+ * editorDrawStatusBar:
+ * 
+ * Draws a status bar at the bottom of the terminal screen containing filename
+ * of currently worked on file. Takes in output buffer <struct abuf * ab> and 
+ * adds status bar to bottom of it. Assumes ab is on a new line already.
+*/
+void editorDrawStatusBar(struct abuf * ab) {
+    abAppend(ab, "\x1b[7m", 4);  // invert colors of text
+    char status[80], rstatus[80];  // TODO: should this be expanded
+    int len, rlen;
+
+    len = snprintf(status, sizeof(status), "%.20s - %d lines", 
+        E.filename ? E.filename : "[No Name]", E.numrows);
+
+    rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
+        E.cy + 1, E.numrows);
+
+    if (len > E.screencols) len = E.screencols;
+    abAppend(ab, status, len);
+
+    while (len < E.screencols) {
+        if (E.screencols - len == rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
         }
+    }
+    abAppend(ab, "\x1b[m", 3);  // reset to default color of text
+    abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf * ab) {
+    abAppend(ab, "\x1b[K", 3);
+    int msglen = strnlen(E.statusmsg, sizeof(E.statusmsg));
+    if (msglen > E.screencols) msglen = E.screencols;
+    if (msglen && time(NULL) - E.statusmsg_time < 5) {
+        // display message for 5 seconds only
+        abAppend(ab, E.statusmsg, msglen);
     }
 }
 
@@ -446,6 +502,8 @@ void editorRefreshScreen() {
     abAppend(&ab, "\x1b[H", 3); // move cursor to 1,1
 
     editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
 
     // move cursor to E.cx, E.cy
     char buf[32];
@@ -457,6 +515,19 @@ void editorRefreshScreen() {
 
     write(STDOUT_FILENO, ab.b, ab.len);
     abFree(&ab);
+}
+
+/**
+ * editorSetStatusMessage:
+ * 
+ * Add formated status to E.statusmsg and update E.statusmsglen accordingly.
+*/
+void editorSetStatusMessage(const char * fmt, ...) {
+    va_list ap;  // holds args passed?
+    va_start(ap, fmt);
+    vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+    va_end(ap);
+    E.statusmsg_time = time(NULL);
 }
 
 /*** input ***/
@@ -575,11 +646,15 @@ void initEditor() {
     E.cy = 0;
     E.rx = 0;
     E.numrows = 0;
-    E.row = NULL;
     E.rowoff = 0;
     E.coloff = 0;
+    E.row = NULL;
+    E.filename = NULL;
+    E.statusmsg[0] = '\0';
+    E.statusmsg_time = 0;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+    E.screenrows -= 2;
 }
 
 int main(int argc, char * argv[]) {
@@ -588,6 +663,8 @@ int main(int argc, char * argv[]) {
     if (argc >= 2) {
         editorOpen(argv[1]);
     }
+
+    editorSetStatusMessage("HELP: Ctrl+Q/C = quit");
 
     while (1) {
         editorRefreshScreen();
