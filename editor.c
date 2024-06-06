@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #define CTRL_KEY(k) (k & 0x1f)
 
 enum editorKey {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -53,6 +55,7 @@ struct editorConfig {
     int screencols; 
     int numrows;
     erow * row;
+    int dirty;  // is there any dif from original file
     char * filename;
     char statusmsg[80];
     time_t statusmsg_time;
@@ -60,6 +63,11 @@ struct editorConfig {
 };
 
 struct editorConfig E;
+
+/*** prototypes ***/
+
+void editorSetStatusMessage(const char *fmt, ...);
+void editorRefreshScreen();
 
 /** terminal ***/
 
@@ -284,16 +292,18 @@ void editorUpdateRow(erow * row) {
 }
 
 /**
- * editorAppendRow:
+ * editorInsertRow:
  * 
- * Add new row to E.row's with the inputted string s with atmost len bytes 
- * copied.
+ * Inserts a new row which will be at E.row[at], will contain len bytes from s,
+ * and updates all other vairables in E.row[at].
 */
-void editorAppendRow(char * s, size_t len) {
+void editorInsertRow(int at, char * s, size_t len) {
+    if (at < 0 || at > E.numrows) return;
+
     // TODO: add error handling of failed realloc
     E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+    memmove(E.row + at + 1, E.row + at, sizeof(erow) * (E.numrows - at));
 
-    int at = E.numrows;  // at is always valid psoition in E.row
     E.row[at].size = len;
     E.row[at].chars = malloc(len + 1);
     memcpy(E.row[at].chars, s, len);
@@ -304,6 +314,144 @@ void editorAppendRow(char * s, size_t len) {
     editorUpdateRow(E.row + at);
 
     E.numrows++;
+    E.dirty++;
+}
+
+/**
+ * editorAppendRow:
+ * 
+ * Add new row to E.row's with the inputted string s with atmost len bytes 
+ * copied. Wrapper for editorInsertRow.
+*/
+void editorAppendRow(char * s, size_t len) {
+    editorInsertRow(E.numrows, s, len);
+}
+
+/**
+ * editorFreeRow:
+ * 
+ * Free all allocated memory withing the erow, does not free the erow itself.
+*/
+void editorFreeRow(erow * row) {
+    free(row->chars);
+    free(row->render);
+}
+
+/**
+ * editorDelRow:
+ * 
+ * Delete row <int at> in E.row.
+*/
+void editorDelRow(int at) {
+    if (at < 0 || at >= E.numrows) return;
+    editorFreeRow(E.row + at);
+    memmove(E.row + at, E.row + at + 1, sizeof(erow) * (E.numrows - at - 1));
+    E.numrows--;
+    E.dirty++;
+}
+
+/**
+ * editorRowInsertChar:
+ * 
+ * Insert a character c into row->chars[at], expands row->chars, and calls 
+ * editorUpdateRow to update row->render.
+*/
+void editorRowInsertChar(erow * row, int at, int c) {
+    if (at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);  // TODO: failed realloc?
+    memmove(row->chars + at + 1, row->chars + at, row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+/**
+ * editorRowAppendString:
+ * 
+ * Append <size_t len> bytes from string <char * s> to row->chars and update
+ * row->size, row->render calling editorUpdateRow. 
+*/
+void editorRowAppendString(erow * row, char * s, size_t len) {
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(row->chars + row->size, s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+/**
+ * editorRowDeleteChar:
+ * 
+ * Delete a character in row at position <int at>.
+*/
+void editorRowDeleteChar(erow * row, int at) {
+    if (at < 0 || at >= row->size) return;
+    memmove(row->chars + at, row->chars + at + 1, row->size - at);
+    row->size--;
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+/***  editor operations  ***/
+
+/**
+ * editorInsertChar:
+ * 
+ * Insert charcter c into a current cursor x,y positions.
+*/
+void editorInsertChar(int c) {
+    if (E.cy == E.numrows) {
+        editorAppendRow("", 0);
+    }
+    editorRowInsertChar(E.row + E.cy, E.cx, c);
+    E.cx++;
+}
+
+/**
+ * editorDelChar:
+ * 
+ * Deleted the character before the current cursor position and decrements
+ * the cursor 1 to the left. Calls editorRowDeleteChar. If at end of file
+ * does nothing.
+*/
+void editorDelChar() {
+    if (E.cy == E.numrows) return;
+    if (E.cx == 0 && E.cy == 0) return;
+
+    erow * row = E.row + E.cy;
+    if (E.cx > 0) {
+        editorRowDeleteChar(row, E.cx - 1);
+        E.cx--;
+    } else {
+        E.cx = E.row[E.cy - 1].size;
+        editorRowAppendString(E.row + E.cy - 1, row->chars, row->size);
+        editorDelRow(E.cy);
+        E.cy--;
+    }
+}
+
+/**
+ * editorInsertNewLine:
+ * 
+ * Insert a NewLine at the current cursor positon and move to start of newline.
+*/
+void editorInsertNewLine() {
+    if (E.cx == 0) {
+        /* start of row*/
+        editorInsertRow(E.cy, "", 0);
+    } else {
+        /* split row */
+        erow * row = E.row + E.cy;
+        editorInsertRow(E.cy + 1, row->chars + E.cx, row->size - E.cx);
+        row = E.row + E.cy;  // editorInsertRow realloc may change row address
+        row->size = E.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+    }
+    E.cy++;
+    E.cx = 0;
 }
 
 /***  file i/o  ***/
@@ -333,6 +481,7 @@ void editorOpen(char * filename) {
     }
     free(line);
     fclose(fp);
+    E.dirty = 0;
 }
 
 /*** append buffer ***/
@@ -455,8 +604,9 @@ void editorDrawStatusBar(struct abuf * ab) {
     char status[80], rstatus[80];  // TODO: should this be expanded
     int len, rlen;
 
-    len = snprintf(status, sizeof(status), "%.20s - %d lines", 
-        E.filename ? E.filename : "[No Name]", E.numrows);
+    len = snprintf(status, sizeof(status), "%.20s - %d lines %s", 
+        E.filename ? E.filename : "[No Name]", E.numrows,
+        E.dirty ? "(modified)" : "");
 
     rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
         E.cy + 1, E.numrows);
@@ -576,6 +726,7 @@ void editorMoveCursor(int key) {
  * 
  * Process keypress and do special functions if it is a special charcater
  * > ctrl+q/q:      Quit program
+ * > ctrl+s:        Save file
  * > arrow keys:    Move Cursor
  * > pgUp:          Move cursor to top of screen
  * > pgDn:          Move cursor to bottom of screen
@@ -587,19 +738,17 @@ void editorProcessKeypress() {
     int c = editorReadKey();
 
     switch (c) {
-        case CTRL_KEY('q'):
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(0);
+        case '\r':
+            editorInsertNewLine();
             break;
+        case CTRL_KEY('q'):
         case CTRL_KEY('c'):
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
-        case DEL_KEY:
-            E.cx = 0;
-            E.cy = 0;
+        case CTRL_KEY('s'):
+            // TODO
             break;
         case HOME_KEY:
             E.cx = 0;
@@ -609,6 +758,14 @@ void editorProcessKeypress() {
                 E.cx = E.row[E.cy].size;
             }
             break;
+
+        case BACKSPACE:
+        case CTRL_KEY('h'): // original backspace character
+        case DEL_KEY:
+            if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+            editorDelChar();
+            break;
+
         case PAGE_UP:
         case PAGE_DOWN:
             {
@@ -630,6 +787,14 @@ void editorProcessKeypress() {
         case ARROW_LEFT:
             editorMoveCursor(c);
             break;
+
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+
+        default:
+            editorInsertChar(c);
+            break;
     }
 }
 
@@ -649,6 +814,7 @@ void initEditor() {
     E.rowoff = 0;
     E.coloff = 0;
     E.row = NULL;
+    E.dirty = 0;
     E.filename = NULL;
     E.statusmsg[0] = '\0';
     E.statusmsg_time = 0;
