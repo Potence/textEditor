@@ -21,6 +21,7 @@
 
 #define EDITOR_VERSION "0.1"
 #define EDITOR_TAB_LEN 8
+#define EDITOR_QUIT_TIMES 1
 
 #define CTRL_KEY(k) (k & 0x1f)
 
@@ -68,6 +69,7 @@ struct editorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
+char *editorPrompt(char *prompt);
 
 /** terminal ***/
 
@@ -457,6 +459,32 @@ void editorInsertNewLine() {
 /***  file i/o  ***/
 
 /**
+ * editorRowsToString:
+ * 
+ * Put all rows into a string with '\n' seperating rows and return. Place 
+ * total length of constructed string into <int * buflen>.
+*/
+char * editorRowsToString(int * buflen) {
+    int totlen = 0;
+    
+    for (int i = 0; i < E.numrows; i++) {
+        totlen += E.row[i].size + 1;  //TODO: should buflen be here
+    }
+    *buflen = totlen;
+
+    char * buf = malloc(totlen);  // TODO error handling
+    char * cur = buf;
+    for (int i = 0; i < E.numrows; i++) {
+        memcpy(cur, E.row[i].chars, E.row[i].size);
+        cur += E.row[i].size;
+        *cur = '\n';
+        cur++;
+    }
+
+    return buf;
+}
+
+/**
  * editorOpen:
  * 
  * Opens a file and reads the first line of the file and stores it in the row
@@ -482,6 +510,40 @@ void editorOpen(char * filename) {
     free(line);
     fclose(fp);
     E.dirty = 0;
+}
+
+/**
+ * editorSave:
+ * 
+ * Save all rows in E.row into E.filename using editorRowsToString.
+*/
+void editorSave() {
+    if (E.filename == NULL) {
+        E.filename = editorPrompt("Save as : %s (ESC to cancel)");
+        if (E.filename == NULL) {
+            editorSetStatusMessage("Save Aborted");
+            return;
+        }
+    }
+
+    int len;
+    char * buf = editorRowsToString(&len);
+
+    int fd = open(E.filename, O_RDWR | O_CREAT, 0644); // open or create file
+    if (fd != -1) {
+        if ((ftruncate(fd, len)) != -1) {
+            if ((write(fd, buf, len)) == len) {
+                close(fd);
+                free(buf);
+                E.dirty = 0;
+                editorSetStatusMessage("%d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buf);
+    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
 }
 
 /*** append buffer ***/
@@ -682,6 +744,41 @@ void editorSetStatusMessage(const char * fmt, ...) {
 
 /*** input ***/
 
+char * editorPrompt(char * prompt) {
+    size_t bufsize = 128;
+    char * buf = malloc(bufsize);  // TODO:erorr handling
+
+    size_t buflen = 0;
+    buf[0] = '\0';
+
+    while (1) { // TODO: should set limit on  buflen?
+        editorSetStatusMessage(prompt, buf);
+        editorRefreshScreen();
+
+        int c = editorReadKey();
+        if (c == BACKSPACE || c == CTRL_KEY('h') || c == DEL_KEY) {
+            if (buflen != 0) buf[--buflen] = '\0';
+        } else if (c == '\x1b') {
+            /* escape */
+            editorSetStatusMessage("");
+            free(buf);
+            return NULL;
+        } else if (c == '\r') {
+            if (buflen != 0) {
+                editorSetStatusMessage("");
+                return buf;
+            }
+        } else if (!iscntrl(c) && c < 128) {
+            if (buflen == bufsize - 1) {
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+            buf[buflen++] = c;
+            buf[buflen] = '\0';
+        }
+    }
+}
+
 /**
  * editorMoveCursor:
  * 
@@ -735,6 +832,8 @@ void editorMoveCursor(int key) {
  * > del:           Move cursor to 0,0
 */
 void editorProcessKeypress() {
+    static int quit_times = EDITOR_QUIT_TIMES;
+
     int c = editorReadKey();
 
     switch (c) {
@@ -743,12 +842,18 @@ void editorProcessKeypress() {
             break;
         case CTRL_KEY('q'):
         case CTRL_KEY('c'):
+            if (E.dirty && quit_times > 0) {
+                editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+                "Press Ctrl-Q %d more times to quit.", quit_times);
+                quit_times--;
+                return;
+            }
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
             break;
         case CTRL_KEY('s'):
-            // TODO
+            editorSave();
             break;
         case HOME_KEY:
             E.cx = 0;
@@ -796,6 +901,7 @@ void editorProcessKeypress() {
             editorInsertChar(c);
             break;
     }
+    quit_times = EDITOR_QUIT_TIMES;
 }
 
 /*** init ***/
@@ -830,7 +936,7 @@ int main(int argc, char * argv[]) {
         editorOpen(argv[1]);
     }
 
-    editorSetStatusMessage("HELP: Ctrl+Q/C = quit");
+    editorSetStatusMessage("HELP: CTRL+S = save | Ctrl+Q/C = quit");
 
     while (1) {
         editorRefreshScreen();
