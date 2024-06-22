@@ -69,7 +69,7 @@ struct editorConfig E;
 
 void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
-char *editorPrompt(char *prompt);
+char *editorPrompt(char *prompt, void (*callback)(char *, int));
 
 /** terminal ***/
 
@@ -262,6 +262,26 @@ int editorRowCxToRx(erow * row, int cx) {
         rx++;
     }
     return rx;
+}
+
+/**
+ * editorRowRxToCx:
+ * 
+ * Convert the text documents row->render rx index to row->chars cx index.
+*/
+int editorRowRxToCx(erow * row, int rx) {
+    int cur_rx = 0;
+    int cx = 0;
+
+    for (cx = 0; cx < row->size; cx++) {
+        if (row->chars[cx] == '\t') {
+            cur_rx += (EDITOR_TAB_LEN - 1) - (cur_rx % EDITOR_TAB_LEN);
+        }
+        cur_rx++;
+
+        if (cur_rx > rx) return cx;
+    }
+    return cx;
 }
 
 /**
@@ -519,7 +539,7 @@ void editorOpen(char * filename) {
 */
 void editorSave() {
     if (E.filename == NULL) {
-        E.filename = editorPrompt("Save as : %s (ESC to cancel)");
+        E.filename = editorPrompt("Save as : %s (ESC to cancel)", NULL);
         if (E.filename == NULL) {
             editorSetStatusMessage("Save Aborted");
             return;
@@ -544,6 +564,59 @@ void editorSave() {
     }
     free(buf);
     editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+/*** find ***/
+
+/**
+ * editorFindCallback
+ * 
+ * Given a query string <cahr * query> finds its occurence in document and
+ * moves cursor to found location if it exists. Does nothing if given key
+ * is enter or escape character.
+ */
+void editorFindCallback(char * query, int key) {
+    if (key == '\r' || key == '\x1b') {
+        // leave search mode if enter or esc pressed
+        return;
+    }
+
+    for (int i = 0; i < E.numrows; i++) {
+        erow * row = E.row + i;
+        char * match = strstr(row->render, query);  // TODO: look through row->char?
+        if (match) {
+            E.cy = i;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            E.rowoff = E.numrows; // go to botttom and editorScroll will update to right pos
+            break;
+        }
+    }
+}
+
+/**
+ * editorFind:
+ * 
+ * Creates an editorPrompt and navigates cursor to inputted string within 
+ * document. Utilizes editorFindCallback.
+ */
+void editorFind() {
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.coloff;
+    int saved_rowoff = E.rowoff;
+
+    char * query = editorPrompt("Search: %s (ESC to cancel)", editorFindCallback);
+
+    if (query) {
+        // accepted serach
+        free(query);
+    } else {
+        // escaped / cancelled search
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff; 
+    }
 }
 
 /*** append buffer ***/
@@ -744,7 +817,7 @@ void editorSetStatusMessage(const char * fmt, ...) {
 
 /*** input ***/
 
-char * editorPrompt(char * prompt) {
+char * editorPrompt(char * prompt, void (*callback)(char *, int)) {
     size_t bufsize = 128;
     char * buf = malloc(bufsize);  // TODO:erorr handling
 
@@ -761,11 +834,14 @@ char * editorPrompt(char * prompt) {
         } else if (c == '\x1b') {
             /* escape */
             editorSetStatusMessage("");
+            if (callback) callback(buf, c);
             free(buf);
             return NULL;
         } else if (c == '\r') {
+            /* newline */
             if (buflen != 0) {
                 editorSetStatusMessage("");
+                if (callback) callback(buf, c);
                 return buf;
             }
         } else if (!iscntrl(c) && c < 128) {
@@ -776,6 +852,7 @@ char * editorPrompt(char * prompt) {
             buf[buflen++] = c;
             buf[buflen] = '\0';
         }
+        if (callback) callback(buf, c);
     }
 }
 
@@ -855,6 +932,9 @@ void editorProcessKeypress() {
         case CTRL_KEY('s'):
             editorSave();
             break;
+        case CTRL_KEY('f'):
+            editorFind();
+            break;
         case HOME_KEY:
             E.cx = 0;
             break;
@@ -863,14 +943,12 @@ void editorProcessKeypress() {
                 E.cx = E.row[E.cy].size;
             }
             break;
-
         case BACKSPACE:
         case CTRL_KEY('h'): // original backspace character
         case DEL_KEY:
             if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
             editorDelChar();
             break;
-
         case PAGE_UP:
         case PAGE_DOWN:
             {
@@ -936,7 +1014,7 @@ int main(int argc, char * argv[]) {
         editorOpen(argv[1]);
     }
 
-    editorSetStatusMessage("HELP: CTRL+S = save | Ctrl+Q/C = quit");
+    editorSetStatusMessage("HELP: CTRL+S = save | Ctrl+Q/C = quit | Ctrl+F = find");
 
     while (1) {
         editorRefreshScreen();
